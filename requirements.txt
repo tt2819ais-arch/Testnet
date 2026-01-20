@@ -1,4 +1,4 @@
 telethon==1.28.5
-python-telegram-bot==20.3
+aiogram==3.0.0b7
 python-dotenv==1.0.0
 cryptography==41.0.7
