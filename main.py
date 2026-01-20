@@ -1,7 +1,5 @@
 """
-Telegram User Bot - AI помощник в личных чатах через ваш аккаунт
-Работает ТОЛЬКО в личных чатах (DM), не в группах
-Включается/выключается командой .старт/.стоп в каждом чате отдельно
+Telegram AI User Bot - с прямыми значениями для bothost.ru
 """
 
 import asyncio
@@ -33,20 +31,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Проверяем переменные окружения
-API_ID = os.getenv('22435995')
-API_HASH = os.getenv('4c7b651950ed7f53520e66299453144d')
-OPENROUTER_API_KEY = os.getenv('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')
-
-if not API_ID or not API_HASH or not OPENROUTER_API_KEY:
-    logger.error("Установите переменные окружения: API_ID, API_HASH, OPENROUTER_API_KEY")
-    sys.exit(1)
-
-try:
-    API_ID = int(API_ID)
-except ValueError:
-    logger.error("API_ID должен быть числом!")
-    sys.exit(1)
+# ========== ПРЯМЫЕ ЗНАЧЕНИЯ (ВСТАВЬТЕ СВОИ) ==========
+API_ID = 22435995  # ВАШ API_ID (число)
+API_HASH = "4c7b651950ed7f53520e66299453144d"  # ВАШ API_HASH
+OPENROUTER_API_KEY = "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"  # ВАШ КЛЮЧ
 
 MODEL = "xiaomi/mimo-v2-flash:free"
 SESSION_FILE = "userbot_session"
