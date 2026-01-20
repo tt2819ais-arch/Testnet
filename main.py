@@ -39,7 +39,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ========== ПРЯМЫЕ ЗНАЧЕНИЯ ==========
-BOT_TOKEN = "7643617149:AAHdYrO3krPYv7bEQy0EJxj8Uh7SJCbNK24"  # Токен вашего бота
+BOT_TOKEN = "7802806814:AAEymolTEcHxNUnUoscRDDOQ2mpMmAtS0hg"  # Токен вашего бота
 API_ID = 22435995  # Ваш API_ID
 API_HASH = "4c7b651950ed7f53520e66299453144d"  # Ваш API_HASH
 OPENROUTER_API_KEY = "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"  # Ваш ключ
