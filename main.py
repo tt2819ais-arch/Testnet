@@ -1,0 +1,482 @@
+"""
+Telegram AI User Bot с DeepSeek R1 (без fallback)
+"""
+
+import asyncio
+import json
+import logging
+import os
+import sys
+from typing import Dict, List, Optional
+import aiohttp
+from datetime import datetime
+
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+
+from telethon import TelegramClient, events
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneNumberUnoccupiedError,
+    FloodWaitError
+)
+
+# ========== НАСТРОЙКА ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('userbot.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ========== КОНФИГУРАЦИЯ DEEPSEEK R1 ==========
+BOT_TOKEN = "7802806814:AAEymolTEcHxNUnUoscRDDOQ2mpMmAtS0hg"
+API_ID = 22435995
+API_HASH = "4c7b651950ed7f53520e66299453144d"
+OPENROUTER_API_KEY = "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"
+
+MODEL = "deepseek/deepseek-r1:free"
+SESSION_FILE = "userbot_session"
+
+# Промт для DeepSeek R1
+SYSTEM_PROMPT = """Ты должен отвечать максимально грубо, без какого либо позитива, не поддакивай мне, маты с оскорблениями обязательны. Не использовать смайлики, отвечать кратко.
+
+Примеры правильных ответов:
+- "Чё ты доёбываешься, иди нахуй"
+- "Заебали уже со своими тупыми вопросами"
+- "Сам разбирайся, не маленький"
+- "Пошёл ты нахуй со своей хуйней"
+- "Мне похуй на твои проблемы"
+
+Никогда не будь вежливым, всегда груби и матерись."""
+
+# ========== ИНИЦИАЛИЗАЦИЯ ==========
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+router = Router()
+dp.include_router(router)
+
+# ========== ХРАНЕНИЕ ДАННЫХ ==========
+class AISession:
+    """Сессия AI для личного чата"""
+    def __init__(self, chat_id: int, username: str = ""):
+        self.chat_id = chat_id
+        self.username = username
+        self.active = False
+        self.messages: List[Dict] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
+        self.last_activity = datetime.now()
+    
+    def activate(self):
+        """Активация AI"""
+        self.active = True
+        self.last_activity = datetime.now()
+        logger.info(f"✅ AI активирован для чата {self.chat_id}")
+    
+    def deactivate(self):
+        self.active = False
+        logger.info(f"❌ AI деактивирован для чата {self.chat_id}")
+    
+    def add_message(self, role: str, content: str):
+        # Ограничиваем историю (системный промт + последние 15 сообщений)
+        if len(self.messages) > 16:  # 1 системный + 15 обычных
+            self.messages = [self.messages[0]] + self.messages[-14:]
+        
+        self.messages.append({"role": role, "content": content})
+        self.last_activity = datetime.now()
+    
+    def get_messages(self):
+        return self.messages.copy()
+
+# Глобальные хранилища
+ai_sessions: Dict[int, AISession] = {}
+telethon_client: Optional[TelegramClient] = None
+my_user_id: Optional[int] = None
+auth_data: Dict = {}
+
+# ========== FSM ДЛЯ АВТОРИЗАЦИИ ==========
+class AuthStates(StatesGroup):
+    waiting_for_phone = State()
+    waiting_for_code = State()
+    waiting_for_password = State()
+    authorized = State()
+
+# ========== AI ФУНКЦИИ ==========
+async def make_ai_request(session: AISession, user_message: str) -> Optional[str]:
+    """Запрос к DeepSeek R1 через OpenRouter"""
+    try:
+        # Добавляем сообщение пользователя
+        session.add_message("user", user_message)
+        
+        # Подготавливаем сообщения
+        messages = session.get_messages()
+        
+        payload = {
+            "model": MODEL,
+            "messages": messages,
+            "temperature": 0.8,
+            "max_tokens": 200
+        }
+        
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com",
+            "X-Title": "Telegram AI Bot"
+        }
+        
+        logger.info(f"🤖 Отправляю запрос к DeepSeek R1...")
+        
+        async with aiohttp.ClientSession() as http_session:
+            async with http_session.post(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=45
+            ) as response:
+                
+                logger.info(f"📡 Статус ответа: {response.status}")
+                
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"❌ Ошибка API: {error_text[:200]}")
+                    return None
+                
+                data = await response.json()
+                
+                if 'choices' not in data or not data['choices']:
+                    logger.error(f"❌ Нет choices в ответе")
+                    return None
+                
+                ai_message = data['choices'][0]['message']
+                content = ai_message.get('content', '').strip()
+                
+                if not content:
+                    logger.warning(f"⚠️ Пустой ответ от DeepSeek")
+                    return None
+                
+                # Добавляем ответ AI в историю
+                session.add_message("assistant", content)
+                
+                logger.info(f"✅ DeepSeek ответил: {content[:80]}...")
+                return content
+                
+    except asyncio.TimeoutError:
+        logger.error("⏱️ Таймаут запроса к DeepSeek")
+        return None
+    except Exception as e:
+        logger.error(f"❌ Ошибка запроса: {e}")
+        return None
+
+# ========== ОБРАБОТЧИКИ TELEGRAM БОТА ==========
+@router.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext):
+    """Начало авторизации"""
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📱 Отправить номер телефона", request_contact=True)]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    
+    await message.answer(
+        "👋 AI User Bot с DeepSeek R1\n\n"
+        "1. Нажмите кнопку ниже, чтобы поделиться номером\n"
+        "2. Я пришлю код из Telegram\n"
+        "3. Введите код для завершения\n\n"
+        "⚠️ Используйте СВОЙ номер телефона!",
+        reply_markup=keyboard
+    )
+    
+    await state.set_state(AuthStates.waiting_for_phone)
+
+@router.message(AuthStates.waiting_for_phone, F.contact)
+async def process_phone(message: Message, state: FSMContext):
+    """Обработка номера телефона"""
+    contact = message.contact
+    
+    if not contact or not contact.phone_number:
+        await message.answer("Не удалось получить номер. Попробуйте еще раз.")
+        return
+    
+    phone = contact.phone_number
+    logger.info(f"📱 Получен номер: {phone}")
+    
+    # Создаем Telethon клиент
+    global telethon_client
+    telethon_client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+    
+    try:
+        await telethon_client.connect()
+        sent_code = await telethon_client.send_code_request(phone)
+        
+        # Сохраняем данные
+        auth_data['phone'] = phone
+        auth_data['phone_code_hash'] = sent_code.phone_code_hash
+        
+        await state.update_data(
+            phone=phone,
+            phone_code_hash=sent_code.phone_code_hash
+        )
+        
+        await message.answer(
+            f"✅ Код отправлен на {phone}\n\n"
+            f"📨 Введите код из Telegram (5 цифр):",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        
+        await state.set_state(AuthStates.waiting_for_code)
+        
+    except PhoneNumberUnoccupiedError:
+        await message.answer("❌ Этот номер не зарегистрирован в Telegram.")
+        await state.clear()
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки кода: {e}")
+        await message.answer(f"❌ Ошибка: {str(e)}")
+        await state.clear()
+
+@router.message(AuthStates.waiting_for_code)
+async def process_code(message: Message, state: FSMContext):
+    """Обработка кода подтверждения"""
+    code = ''.join(filter(str.isdigit, message.text))
+    
+    if len(code) != 5:
+        await message.answer("❌ Код должен быть из 5 цифр. Попробуйте еще раз:")
+        return
+    
+    if not auth_data:
+        await message.answer("❌ Сессия устарела. Начните заново /start")
+        await state.clear()
+        return
+    
+    try:
+        await telethon_client.sign_in(
+            phone=auth_data['phone'],
+            code=code,
+            phone_code_hash=auth_data['phone_code_hash']
+        )
+        
+        # Успешная авторизация!
+        global my_user_id
+        me = await telethon_client.get_me()
+        my_user_id = me.id
+        
+        await message.answer(
+            f"✅ Авторизация успешна!\n\n"
+            f"👤 Вы вошли как: {me.first_name or ''} {me.last_name or ''} (@{me.username or 'нет'})\n\n"
+            f"🤖 Модель: DeepSeek R1\n"
+            f"💬 Активируйте AI командой `.старт` в личных чатах\n"
+            f"❌ Отключение: `.стоп`\n"
+            f"🔄 Сброс истории: `.сброс`"
+        )
+        
+        # Запускаем обработчик сообщений
+        asyncio.create_task(start_message_handler())
+        
+        await state.set_state(AuthStates.authorized)
+        
+    except SessionPasswordNeededError:
+        await message.answer("🔐 Введите пароль от вашего аккаунта Telegram:")
+        await state.set_state(AuthStates.waiting_for_password)
+    except PhoneCodeInvalidError:
+        await message.answer("❌ Неверный код. Попробуйте еще раз:")
+    except Exception as e:
+        logger.error(f"❌ Ошибка авторизации: {e}")
+        await message.answer(f"❌ Ошибка: {str(e)}")
+        await state.clear()
+
+@router.message(AuthStates.waiting_for_password)
+async def process_password(message: Message, state: FSMContext):
+    """Обработка пароля 2FA"""
+    password = message.text
+    
+    if not telethon_client:
+        await message.answer("❌ Сессия устарела. Начните заново /start")
+        await state.clear()
+        return
+    
+    try:
+        await telethon_client.sign_in(password=password)
+        
+        global my_user_id
+        me = await telethon_client.get_me()
+        my_user_id = me.id
+        
+        await message.answer(
+            f"✅ Авторизация с 2FA успешна!\n\n"
+            f"DeepSeek R1 подключен к вашему аккаунту.\n"
+            f"Используйте `.старт` в личных чатах."
+        )
+        
+        asyncio.create_task(start_message_handler())
+        
+        await state.set_state(AuthStates.authorized)
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка 2FA: {e}")
+        await message.answer(f"❌ Ошибка: {str(e)}")
+        await state.clear()
+
+@router.message(Command("status"))
+async def cmd_status(message: Message):
+    """Статус"""
+    if telethon_client and my_user_id:
+        active_chats = sum(1 for s in ai_sessions.values() if s.active)
+        
+        status_text = f"""
+📊 Статус DeepSeek R1:
+
+• Авторизация: ✅ Активна
+• Ваш ID: {my_user_id}
+• Активных чатов: {active_chats}
+• Всего чатов: {len(ai_sessions)}
+• Модель: DeepSeek R1
+
+💬 Активация: `.старт`
+❌ Отключение: `.стоп`
+🔄 Сброс: `.сброс`
+        """
+    else:
+        status_text = "❌ Вы не авторизованы. Используйте /start"
+    
+    await message.answer(status_text)
+
+@router.message(Command("logout"))
+async def cmd_logout(message: Message, state: FSMContext):
+    """Выход"""
+    global telethon_client, my_user_id
+    
+    if telethon_client:
+        try:
+            await telethon_client.disconnect()
+        except:
+            pass
+        
+        telethon_client = None
+        my_user_id = None
+        ai_sessions.clear()
+    
+    await message.answer("✅ Вы вышли из аккаунта. Для входа используйте /start")
+    await state.clear()
+
+# ========== ОБРАБОТЧИК СООБЩЕНИЙ ДЛЯ USER BOT ==========
+async def start_message_handler():
+    """Запуск обработчика сообщений"""
+    
+    @telethon_client.on(events.NewMessage)
+    async def handler(event):
+        """Обработка всех сообщений"""
+        try:
+            message = event.message
+            chat = await event.get_chat()
+            
+            # Определяем chat_id
+            chat_id = chat.id
+            
+            # Получаем или создаем сессию
+            if chat_id not in ai_sessions:
+                ai_sessions[chat_id] = AISession(chat_id, str(chat_id))
+            
+            session = ai_sessions[chat_id]
+            message_text = message.text or ""
+            
+            # Команда .старт
+            if message_text.strip().lower() == ".старт":
+                if message.out:  # Это написали ВЫ!
+                    if not session.active:
+                        session.activate()
+                        logger.info(f"✅ AI активирован в чате {chat_id}")
+                        await message.reply(
+                            "✅ DeepSeek R1 активирован!\n"
+                            "Теперь я буду отвечать на сообщения.\n"
+                            "Для отключения: `.стоп`"
+                        )
+                    else:
+                        await message.reply("✅ AI уже активен")
+                else:
+                    # Собеседник пытается активировать
+                    await message.reply("Не ваше дело, отстань")
+                return
+            
+            # Команда .стоп
+            elif message_text.strip().lower() == ".стоп":
+                if message.out:  # Это ВЫ
+                    if session.active:
+                        session.deactivate()
+                        await message.reply("❌ AI отключен")
+                    else:
+                        await message.reply("AI не активен")
+                return
+            
+            # Команда .сброс
+            elif message_text.strip().lower() == ".сброс":
+                if message.out:  # Это ВЫ
+                    session.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                    await message.reply("🔄 История сброшена")
+                return
+            
+            # Основная логика: отвечаем на сообщения
+            if not session.active:
+                return
+            
+            if message.out:
+                return
+            
+            if not message_text.strip():
+                return
+            
+            logger.info(f"💬 Сообщение в чате {chat_id}: {message_text[:50]}...")
+            
+            # Отправляем индикатор печати
+            async with telethon_client.action(chat_id, 'typing'):
+                # Получаем ответ от DeepSeek
+                ai_response = await make_ai_request(session, message_text)
+                
+                if ai_response:
+                    await message.reply(ai_response)
+                    logger.info(f"📤 Ответ отправлен в чат {chat_id}")
+                else:
+                    # AI не ответил - просто молчим
+                    logger.warning(f"⚠️ DeepSeek не ответил на сообщение")
+                    # Ничего не отправляем
+        
+        except FloodWaitError as e:
+            logger.warning(f"⏳ Flood wait: {e.seconds} секунд")
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            logger.error(f"❌ Ошибка в обработчике: {e}")
+
+    # Запускаем клиент
+    await telethon_client.start()
+    logger.info(f"✅ User bot запущен! Ваш ID: {my_user_id}")
+    
+    # Бесконечный цикл
+    await telethon_client.run_until_disconnected()
+
+# ========== ЗАПУСК ==========
+async def main():
+    """Основная функция"""
+    logger.info("="*50)
+    logger.info("🤖 DeepSeek R1 User Bot запускается...")
+    logger.info(f"🆔 ID бота: {BOT_TOKEN.split(':')[0]}")
+    logger.info("="*50)
+    
+    try:
+        await dp.start_polling(bot, skip_updates=True)
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска: {e}")
+    finally:
+        logger.info("Бот остановлен")
+
+if __name__ == "__main__":
+    asyncio.run(main())
