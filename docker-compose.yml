@@ -9,5 +9,3 @@ services:
       - ./sessions:/app/sessions
       - ./config:/app/config
       - ./.env:/app/.env
-    environment:
-      - TZ=Europe/Moscow
