@@ -9,8 +9,13 @@ from cryptography.fernet import Fernet
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from telethon.tl.functions.account import UpdateStatusRequest
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.filters import Command
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+import asyncio
 from dotenv import load_dotenv
 
 # Загрузка переменных окружения
@@ -22,6 +27,10 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Создаем директории
+Path("sessions").mkdir(exist_ok=True)
+Path("config").mkdir(exist_ok=True)
 
 class ConfigManager:
     """Менеджер конфигурации с шифрованием"""
@@ -97,29 +106,52 @@ class UserBotManager:
         self.offline_minutes = 1
         self.running = False
         self.task = None
+        self.me = None
     
-    async def start(self):
-        """Запуск user-bot"""
-        if self.running:
-            return "User-bot уже запущен"
-        
+    async def connect(self):
+        """Подключение клиента"""
         try:
             await self.client.connect()
             
             if not await self.client.is_user_authorized():
-                return "Не авторизован. Используйте /start для настройки"
+                return False, "Не авторизован. Используйте /start для настройки"
+            
+            self.me = await self.client.get_me()
+            return True, f"✅ Подключен как {self.me.first_name}"
+            
+        except Exception as e:
+            return False, f"❌ Ошибка подключения: {str(e)}"
+    
+    async def disconnect(self):
+        """Отключение клиента"""
+        try:
+            await self.client.disconnect()
+            return True, "✅ Отключен"
+        except Exception as e:
+            return False, f"❌ Ошибка отключения: {str(e)}"
+    
+    async def start_online_keeping(self):
+        """Запуск поддержания онлайн статуса"""
+        if self.running:
+            return "User-bot уже запущен"
+        
+        try:
+            # Проверяем подключение
+            if not self.client.is_connected():
+                success, msg = await self.connect()
+                if not success:
+                    return msg
             
             self.running = True
             self.task = asyncio.create_task(self._keep_online_loop())
             
-            me = await self.client.get_me()
-            return f"✅ User-bot запущен для {me.first_name} (@{me.username})"
+            return f"✅ User-bot запущен для {self.me.first_name}"
             
         except Exception as e:
             return f"❌ Ошибка запуска: {str(e)}"
     
-    async def stop(self):
-        """Остановка user-bot"""
+    async def stop_online_keeping(self):
+        """Остановка поддержания онлайн статуса"""
         if not self.running:
             return "User-bot не запущен"
         
@@ -130,8 +162,8 @@ class UserBotManager:
                 await self.task
             except asyncio.CancelledError:
                 pass
+            self.task = None
         
-        await self.client.disconnect()
         return "✅ User-bot остановлен"
     
     async def _keep_online_loop(self):
@@ -141,15 +173,17 @@ class UserBotManager:
         try:
             while self.running:
                 # Устанавливаем онлайн
-                await self.client(UpdateStatusRequest(offline=False))
-                logger.info("Статус: Онлайн")
+                try:
+                    await self.client(UpdateStatusRequest(offline=False))
+                    logger.info("Статус: Онлайн")
+                except Exception as e:
+                    logger.error(f"Ошибка установки онлайн: {e}")
                 
                 # Ждем онлайн-период
                 online_time = self.online_minutes * 60
                 deviation = random.uniform(-0.2, 0.2)
                 actual_online_time = online_time * (1 + deviation)
                 
-                # Счетчик с периодическим логированием
                 for i in range(int(actual_online_time)):
                     if not self.running:
                         break
@@ -162,8 +196,11 @@ class UserBotManager:
                     break
                 
                 # Устанавливаем оффлайн
-                await self.client(UpdateStatusRequest(offline=True))
-                logger.info("Статус: Оффлайн")
+                try:
+                    await self.client(UpdateStatusRequest(offline=True))
+                    logger.info("Статус: Оффлайн")
+                except Exception as e:
+                    logger.error(f"Ошибка установки оффлайн: {e}")
                 
                 # Ждем оффлайн-период
                 offline_time = self.offline_minutes * 60
@@ -172,243 +209,175 @@ class UserBotManager:
                         break
                     await asyncio.sleep(1)
                     
+        except asyncio.CancelledError:
+            logger.info("Цикл поддержания онлайн остановлен")
         except Exception as e:
             logger.error(f"Ошибка в цикле: {e}")
             self.running = False
 
-class TelegramBotHandler:
-    """Обработчик Telegram бота для настройки"""
-    def __init__(self, bot_token: str):
-        self.bot_token = bot_token
-        self.config_manager = ConfigManager()
-        self.userbot = None
-        self.pending_auth = {}  # {user_id: {'api_id': '', 'api_hash': '', 'phone': ''}}
-        
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /start"""
-        user_id = update.effective_user.id
-        
-        # Проверяем существующую конфигурацию
-        config = self.config_manager.load_config()
-        
-        if config:
-            keyboard = [
-                [KeyboardButton("🚀 Запустить user-bot")],
-                [KeyboardButton("🛑 Остановить user-bot")],
-                [KeyboardButton("⚙️ Перенастроить")]
-            ]
-            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            
-            await update.message.reply_text(
-                "✅ Конфигурация найдена!\n"
-                "Выберите действие:",
-                reply_markup=reply_markup
-            )
-            
-            # Создаем экземпляр userbot
-            self.userbot = UserBotManager(config)
-        else:
-            await self._start_setup(update)
+# FSM состояния для настройки
+class AuthStates(StatesGroup):
+    waiting_api_id = State()
+    waiting_api_hash = State()
+    waiting_phone = State()
+    waiting_code = State()
+    waiting_password = State()
+
+# Глобальные объекты
+config_manager = ConfigManager()
+userbot = None
+router = Router()
+
+def get_main_keyboard():
+    """Клавиатура основного меню"""
+    keyboard = [
+        [KeyboardButton(text="🚀 Запустить user-bot")],
+        [KeyboardButton(text="🛑 Остановить user-bot")],
+        [KeyboardButton(text="⚙️ Перенастроить")],
+        [KeyboardButton(text="📊 Статус")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    """Обработчик команды /start"""
+    config = config_manager.load_config()
     
-    async def _start_setup(self, update: Update):
-        """Начало процесса настройки"""
-        await update.message.reply_text(
+    if config:
+        global userbot
+        if userbot is None:
+            userbot = UserBotManager(config)
+            success, msg = await userbot.connect()
+            if not success:
+                await message.answer(f"⚠️ {msg}", reply_markup=get_main_keyboard())
+                return
+        
+        await message.answer(
+            "👋 Добро пожаловать!\n"
+            "User-bot настроен и готов к работе.\n"
+            "Выберите действие:",
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        await message.answer(
             "👋 Добро пожаловать в настройку user-bot!\n\n"
             "Для начала вам нужно получить API ID и API Hash:\n"
             "1. Перейдите на https://my.telegram.org\n"
             "2. Войдите в свой аккаунт\n"
             "3. Перейдите в 'API Development Tools'\n"
             "4. Создайте приложение и получите данные\n\n"
-            "Введите ваш API ID (только цифры):"
+            "Введите ваш API ID (только цифры):",
+            reply_markup=ReplyKeyboardRemove()
         )
-        self.pending_auth[update.effective_user.id] = {}
+        await message.answer("Или нажмите /cancel для отмены")
+
+@router.message(F.text == "🚀 Запустить user-bot")
+async def start_userbot(message: Message):
+    """Запуск user-bot"""
+    if userbot is None:
+        await message.answer("❌ User-bot не настроен. Используйте /start для настройки")
+        return
     
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик текстовых сообщений"""
-        user_id = update.effective_user.id
-        text = update.message.text
-        
-        # Обработка кнопок
-        if text == "🚀 Запустить user-bot" and self.userbot:
-            result = await self.userbot.start()
-            await update.message.reply_text(result)
-            return
-        elif text == "🛑 Остановить user-bot" and self.userbot:
-            result = await self.userbot.stop()
-            await update.message.reply_text(result)
-            return
-        elif text == "⚙️ Перенастроить":
-            await self._start_setup(update)
-            return
-        
-        # Процесс настройки
-        if user_id in self.pending_auth:
-            config = self.pending_auth[user_id]
-            
-            if 'api_id' not in config:
-                try:
-                    config['api_id'] = text.strip()
-                    await update.message.reply_text("✅ API ID сохранен\nВведите API Hash:")
-                except ValueError:
-                    await update.message.reply_text("❌ API ID должен содержать только цифры. Попробуйте еще раз:")
-                    
-            elif 'api_hash' not in config:
-                config['api_hash'] = text.strip()
-                await update.message.reply_text("✅ API Hash сохранен\nВведите номер телефона (в международном формате, например +79991234567):")
-                
-            elif 'phone' not in config:
-                config['phone'] = text.strip()
-                
-                # Запрашиваем код подтверждения
-                try:
-                    # Создаем временный клиент для авторизации
-                    temp_client = TelegramClient(
-                        f"sessions/temp_{user_id}",
-                        int(config['api_id']),
-                        config['api_hash']
-                    )
-                    
-                    await temp_client.connect()
-                    sent_code = await temp_client.send_code_request(config['phone'])
-                    
-                    self.pending_auth[user_id]['client'] = temp_client
-                    self.pending_auth[user_id]['phone_code_hash'] = sent_code.phone_code_hash
-                    
-                    await update.message.reply_text(
-                        "✅ Код отправлен на ваш телефон\n"
-                        "Введите код подтверждения:"
-                    )
-                    
-                except Exception as e:
-                    await update.message.reply_text(f"❌ Ошибка отправки кода: {str(e)}")
-                    del self.pending_auth[user_id]
-                    
-            elif 'phone_code_hash' in config and 'code' not in config:
-                # Ввод кода подтверждения
-                try:
-                    temp_client = config['client']
-                    
-                    await temp_client.sign_in(
-                        phone=config['phone'],
-                        code=text.strip(),
-                        phone_code_hash=config['phone_code_hash']
-                    )
-                    
-                    # Проверяем если нужен пароль 2FA
-                    if await temp_client.is_user_authorized():
-                        # Сохраняем конфигурацию
-                        session_path = f"sessions/{config['phone']}"
-                        self.config_manager.save_config(
-                            config['api_id'],
-                            config['api_hash'],
-                            config['phone'],
-                            session_path
-                        )
-                        
-                        # Закрываем временный клиент
-                        await temp_client.disconnect()
-                        
-                        # Создаем основной userbot
-                        self.userbot = UserBotManager({
-                            'api_id': config['api_id'],
-                            'api_hash': config['api_hash'],
-                            'phone': config['phone'],
-                            'session_path': session_path
-                        })
-                        
-                        del self.pending_auth[user_id]
-                        
-                        keyboard = [
-                            [KeyboardButton("🚀 Запустить user-bot")],
-                            [KeyboardButton("⚙️ Перенастроить")]
-                        ]
-                        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-                        
-                        await update.message.reply_text(
-                            "🎉 Авторизация успешна!\n"
-                            "Теперь вы можете запустить user-bot.",
-                            reply_markup=reply_markup
-                        )
-                    else:
-                        await update.message.reply_text("❌ Ошибка авторизации. Попробуйте снова с /start")
-                        
-                except SessionPasswordNeededError:
-                    await update.message.reply_text(
-                        "🔐 Требуется пароль двухфакторной аутентификации.\n"
-                        "Введите пароль 2FA:"
-                    )
-                    self.pending_auth[user_id]['need_password'] = True
-                    
-                except Exception as e:
-                    await update.message.reply_text(f"❌ Ошибка авторизации: {str(e)}")
-                    del self.pending_auth[user_id]
-                    
-            elif config.get('need_password'):
-                # Ввод пароля 2FA
-                try:
-                    temp_client = config['client']
-                    await temp_client.sign_in(password=text.strip())
-                    
-                    # Сохраняем конфигурацию
-                    session_path = f"sessions/{config['phone']}"
-                    self.config_manager.save_config(
-                        config['api_id'],
-                        config['api_hash'],
-                        config['phone'],
-                        session_path
-                    )
-                    
-                    await temp_client.disconnect()
-                    self.userbot = UserBotManager({
-                        'api_id': config['api_id'],
-                        'api_hash': config['api_hash'],
-                        'phone': config['phone'],
-                        'session_path': session_path
-                    })
-                    
-                    del self.pending_auth[user_id]
-                    
-                    keyboard = [
-                        [KeyboardButton("🚀 Запустить user-bot")],
-                        [KeyboardButton("⚙️ Перенастроить")]
-                    ]
-                    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-                    
-                    await update.message.reply_text(
-                        "🎉 Авторизация успешна!\n"
-                        "Теперь вы можете запустить user-bot.",
-                        reply_markup=reply_markup
-                    )
-                    
-                except Exception as e:
-                    await update.message.reply_text(f"❌ Ошибка ввода пароля: {str(e)}")
-                    del self.pending_auth[user_id]
+    result = await userbot.start_online_keeping()
+    await message.answer(result, reply_markup=get_main_keyboard())
+
+@router.message(F.text == "🛑 Остановить user-bot")
+async def stop_userbot(message: Message):
+    """Остановка user-bot"""
+    if userbot is None:
+        await message.answer("❌ User-bot не настроен")
+        return
+    
+    result = await userbot.stop_online_keeping()
+    await message.answer(result, reply_markup=get_main_keyboard())
+
+@router.message(F.text == "📊 Статус")
+async def get_status(message: Message):
+    """Получение статуса"""
+    if userbot is None:
+        await message.answer("❌ User-bot не настроен")
+        return
+    
+    status = "✅ Запущен" if userbot.running else "⏸️ Остановлен"
+    if userbot.me:
+        await message.answer(
+            f"📊 Статус user-bot:\n"
+            f"• Состояние: {status}\n"
+            f"• Аккаунт: {userbot.me.first_name}\n"
+            f"• Онлайн: {userbot.online_minutes} мин\n"
+            f"• Оффлайн: {userbot.offline_minutes} мин"
+        )
+    else:
+        await message.answer(f"Статус: {status}")
+
+@router.message(F.text == "⚙️ Перенастроить")
+async def reconfigure(message: Message):
+    """Перенастройка user-bot"""
+    global userbot
+    
+    if userbot and userbot.running:
+        await userbot.stop_online_keeping()
+    
+    userbot = None
+    # Удаляем конфиг файл
+    config_file = Path("config/userbot_config.enc")
+    if config_file.exists():
+        config_file.unlink()
+    
+    await message.answer(
+        "🔄 Настройка сброшена.\n"
+        "Для новой настройки используйте /start",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+@router.message(F.text == "/cancel")
+async def cancel_handler(message: Message, state: FSMContext):
+    """Отмена текущего действия"""
+    current_state = await state.get_state()
+    if current_state is None:
+        return
+    
+    await state.clear()
+    await message.answer(
+        "❌ Действие отменено",
+        reply_markup=get_main_keyboard()
+    )
 
 async def main():
     """Основная функция"""
-    # Проверяем токен бота
+    # Получаем токен из переменных окружения
     bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
     if not bot_token:
-        logger.error("Токен бота не установлен!")
+        logger.error("❌ Токен бота не установлен в переменных окружения!")
+        logger.error("Добавьте TELEGRAM_BOT_TOKEN в .env файл")
         return
     
-    # Создаем директории
-    Path("sessions").mkdir(exist_ok=True)
-    Path("config").mkdir(exist_ok=True)
+    # Инициализация бота
+    bot = Bot(token=bot_token)
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+    dp.include_router(router)
     
-    # Создаем обработчик
-    bot_handler = TelegramBotHandler(bot_token)
+    # Загрузка существующей конфигурации
+    config = config_manager.load_config()
+    if config:
+        global userbot
+        userbot = UserBotManager(config)
+        success, msg = await userbot.connect()
+        if success:
+            logger.info(f"✅ Автоматически подключен user-bot: {msg}")
+        else:
+            logger.warning(f"⚠️ Не удалось подключить user-bot: {msg}")
     
-    # Создаем приложение бота
-    application = Application.builder().token(bot_token).build()
+    logger.info("✅ Бот запущен")
     
-    # Добавляем обработчики
-    application.add_handler(CommandHandler("start", bot_handler.start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.handle_message))
-    
-    # Запускаем бота
-    logger.info("Бот запущен...")
-    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Запуск бота
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
