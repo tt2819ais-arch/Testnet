@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  userbot:
+    build: .
+    container_name: telegram-userbot
+    restart: unless-stopped
+    volumes:
+      - ./sessions:/app/sessions
+      - ./config:/app/config
+      - ./.env:/app/.env
+    environment:
+      - TZ=Europe/Moscow
