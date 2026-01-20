@@ -1,5 +1,6 @@
 """
-Telegram AI User Bot - авторизация через Telegram бота
+Telegram AI User Bot - Грубый AI помощник
+Активация ТОЛЬКО вами командой .старт в ваших личных чатах
 """
 
 import asyncio
@@ -19,7 +20,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from telethon import TelegramClient, events
-from telethon.tl.types import Message as TLMessage, User
+from telethon.tl.types import Message as TLMessage, User, PeerUser
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
@@ -38,16 +39,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ========== ПРЯМЫЕ ЗНАЧЕНИЯ ==========
-BOT_TOKEN = "7802806814:AAEymolTEcHxNUnUoscRDDOQ2mpMmAtS0hg"  # Токен вашего бота
-API_ID = 22435995  # Ваш API_ID
+# ========== КОНФИГУРАЦИЯ ==========
+# 🔴 ЗАМЕНИТЕ ЭТИ ЗНАЧЕНИЯ НА СВОИ!
+BOT_TOKEN = "7802806814:AAEymolTEcHxNUnUoscRDDOQ2mpMmAtS0hg"  # Получите у @BotFather
+API_ID = 22435995  # Ваш API_ID с my.telegram.org
 API_HASH = "4c7b651950ed7f53520e66299453144d"  # Ваш API_HASH
-OPENROUTER_API_KEY = "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"  # Ваш ключ
+OPENROUTER_API_KEY = "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"  # Ваш ключ OpenRouter
 
 MODEL = "xiaomi/mimo-v2-flash:free"
 SESSION_FILE = "userbot_session"
 
-# ========== ИНИЦИАЛИЗАЦИЯ AIOGRAM ==========
+# Системный промт для грубого AI
+SYSTEM_PROMPT = """Ты должен отвечать максимально грубо, без какого либо позитива, не поддакивай мне, маты с оскорблениями обязательны. Не использовать смайлики, отвечать кратко.
+
+Примеры правильных ответов:
+- "Чё ты доёбываешься, иди нахуй"
+- "Заебали уже со своими тупыми вопросами"
+- "Сам разбирайся, не маленький"
+- "Пошёл ты нахуй со своей хуйней"
+- "Мне похуй на твои проблемы"
+
+Никогда не будь вежливым, всегда груби и матерись."""
+
+# ========== ИНИЦИАЛИЗАЦИЯ ==========
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
@@ -56,28 +70,34 @@ dp.include_router(router)
 # ========== ХРАНЕНИЕ ДАННЫХ ==========
 class AISession:
     """Сессия AI для личного чата"""
-    def __init__(self, user_id: int, username: str = ""):
-        self.user_id = user_id
+    def __init__(self, chat_id: int, username: str = ""):
+        self.chat_id = chat_id
         self.username = username
-        self.active = False
-        self.messages: List[Dict] = []
+        self.active = False  # Активируется ТОЛЬКО когда ВЫ напишете .старт
+        self.messages: List[Dict] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
         self.reasoning_details: Optional[Dict] = None
         self.last_activity = datetime.now()
+        self.activated_by_me = False  # Флаг, что активировали именно ВЫ
     
-    def activate(self):
+    def activate_by_me(self):
+        """Активация ТОЛЬКО когда ВЫ пишете .старт"""
         self.active = True
-        self.messages = []
-        self.reasoning_details = None
+        self.activated_by_me = True
         self.last_activity = datetime.now()
-        logger.info(f"AI активирован для пользователя {self.user_id}")
+        logger.info(f"AI активирован ВАМИ для чата {self.chat_id}")
     
     def deactivate(self):
         self.active = False
-        logger.info(f"AI деактивирован для пользователя {self.user_id}")
+        self.activated_by_me = False
+        logger.info(f"AI деактивирован для чата {self.chat_id}")
     
     def add_message(self, role: str, content: str, reasoning_details: Dict = None):
-        if len(self.messages) > 15:
-            self.messages = self.messages[-14:]
+        # Ограничиваем историю (системный промт + последние 10 сообщений)
+        if len(self.messages) > 11:  # 1 системный + 10 обычных
+            # Сохраняем системный промт и последние 9 сообщений
+            self.messages = [self.messages[0]] + self.messages[-9:]
         
         message = {"role": role, "content": content}
         if role == "assistant" and reasoning_details:
@@ -90,9 +110,10 @@ class AISession:
         return self.messages.copy()
 
 # Глобальные хранилища
-ai_sessions: Dict[int, AISession] = {}
-telethon_clients: Dict[int, TelegramClient] = {}  # user_id -> TelethonClient
-auth_data: Dict[int, Dict] = {}  # user_id -> данные для авторизации
+ai_sessions: Dict[int, AISession] = {}  # chat_id -> AISession
+telethon_client: Optional[TelegramClient] = None  # ЕДИНСТВЕННЫЙ клиент для ВАШЕГО аккаунта
+my_user_id: Optional[int] = None  # Ваш ID в Telegram
+auth_data: Dict = {}  # Данные для авторизации
 
 # ========== FSM ДЛЯ АВТОРИЗАЦИИ ==========
 class AuthStates(StatesGroup):
@@ -103,25 +124,33 @@ class AuthStates(StatesGroup):
 
 # ========== AI ФУНКЦИИ ==========
 async def make_ai_request(session: AISession, user_message: str) -> str:
-    """Запрос к OpenRouter API"""
+    """Запрос к OpenRouter API с грубым промтом"""
     try:
+        # Добавляем сообщение пользователя
         session.add_message("user", user_message)
+        
+        # Подготавливаем сообщения
         messages = session.get_messages()
         
+        # Добавляем reasoning_details от предыдущего ответа
         if (session.reasoning_details and 
-            messages and 
+            len(messages) > 1 and 
             messages[-1].get("role") == "assistant"):
             messages[-1]["reasoning_details"] = session.reasoning_details
         
         payload = {
             "model": MODEL,
             "messages": messages,
-            "reasoning": {"enabled": True}
+            "reasoning": {"enabled": True},
+            "temperature": 0.9,  # Более "творческие" ответы
+            "max_tokens": 150  # Короткие грубые ответы
         }
         
         headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com",
+            "X-Title": "Telegram AI User Bot"
         }
         
         async with aiohttp.ClientSession() as http_session:
@@ -133,25 +162,40 @@ async def make_ai_request(session: AISession, user_message: str) -> str:
             ) as response:
                 
                 if response.status != 200:
-                    return "⚠️ Ошибка при обращении к AI сервису."
+                    error_text = await response.text()
+                    logger.error(f"API Error {response.status}: {error_text}")
+                    
+                    # Грубый ответ при ошибке API
+                    error_responses = [
+                        "Бля, API сдохло, иди нахуй",
+                        "Сервак лег, пошел в пизду",
+                        "Чё-то нихуя не работает, отъебись"
+                    ]
+                    import random
+                    return random.choice(error_responses)
                 
                 data = await response.json()
                 
                 if 'choices' not in data or not data['choices']:
-                    return "⚠️ Неверный ответ от AI."
+                    return "API нихуя не ответило, сука"
                 
                 ai_message = data['choices'][0]['message']
-                content = ai_message.get('content', '')
+                content = ai_message.get('content', 'Молчу, иди нахуй')
                 reasoning_details = ai_message.get('reasoning_details')
                 
+                # Сохраняем reasoning_details
                 session.reasoning_details = reasoning_details
+                
+                # Добавляем ответ AI
                 session.add_message("assistant", content, reasoning_details)
                 
                 return content
                 
+    except asyncio.TimeoutError:
+        return "Бля, долго думает, иди нахуй"
     except Exception as e:
         logger.error(f"AI request error: {e}")
-        return f"⚠️ Ошибка: {str(e)[:100]}"
+        return f"Ошибка: {str(e)[:50]}"
 
 # ========== ОБРАБОТЧИКИ TELEGRAM БОТА ==========
 @router.message(Command("start"))
@@ -192,19 +236,17 @@ async def process_phone(message: Message, state: FSMContext):
     logger.info(f"Пользователь {user_id} отправил номер: {phone}")
     
     # Создаем Telethon клиент
-    session_file = f"session_{user_id}"
-    client = TelegramClient(session_file, API_ID, API_HASH)
+    global telethon_client
+    telethon_client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
     
     try:
-        await client.connect()
-        sent_code = await client.send_code_request(phone)
+        await telethon_client.connect()
+        sent_code = await telethon_client.send_code_request(phone)
         
         # Сохраняем данные
-        auth_data[user_id] = {
-            'phone': phone,
-            'client': client,
-            'phone_code_hash': sent_code.phone_code_hash
-        }
+        auth_data['phone'] = phone
+        auth_data['phone_code_hash'] = sent_code.phone_code_hash
+        auth_data['user_id'] = user_id
         
         await state.update_data(
             phone=phone,
@@ -237,39 +279,37 @@ async def process_code(message: Message, state: FSMContext):
         await message.answer("❌ Код должен быть из 5 цифр. Попробуйте еще раз:")
         return
     
-    if user_id not in auth_data:
+    if not auth_data:
         await message.answer("❌ Сессия устарела. Начните заново /start")
         await state.clear()
         return
     
-    data = auth_data[user_id]
-    client = data['client']
-    phone = data['phone']
-    
     try:
-        await client.sign_in(
-            phone=phone,
+        await telethon_client.sign_in(
+            phone=auth_data['phone'],
             code=code,
-            phone_code_hash=data['phone_code_hash']
+            phone_code_hash=auth_data['phone_code_hash']
         )
         
         # Успешная авторизация!
+        global my_user_id
+        me = await telethon_client.get_me()
+        my_user_id = me.id
+        
         await message.answer(
-            "✅ Авторизация успешна!\n\n"
-            "Теперь AI User Bot подключен к вашему аккаунту.\n\n"
-            "📝 Как использовать:\n"
-            "1. AI будет работать в ваших ЛИЧНЫХ ЧАТАХ\n"
-            "2. В нужном чате напишите `.старт`\n"
-            "3. AI начнет отвечать на сообщения\n"
-            "4. Для отключения напишите `.стоп`\n\n"
-            "⚠️ Работает ТОЛЬКО в личных чатах!"
+            f"✅ Авторизация успешна!\n\n"
+            f"👤 Вы вошли как: {me.first_name or ''} {me.last_name or ''} (@{me.username or 'нет'})\n\n"
+            f"📝 Как использовать ГРУБОГО AI:\n"
+            f"1. Откройте ЛИЧНЫЙ чат с кем-то\n"
+            f"2. Напишите `.старт` (только ВЫ можете это сделать!)\n"
+            f"3. AI начнет грубо отвечать на сообщения\n"
+            f"4. Для отключения напишите `.стоп`\n\n"
+            f"⚠️ Только ВЫ можете активировать AI командой .старт!\n"
+            f"⚠️ AI будет ГРУБЫМ и МАТЕРНЫМ!"
         )
         
-        # Сохраняем клиент
-        telethon_clients[user_id] = client
-        
-        # Запускаем обработчик сообщений для этого пользователя
-        asyncio.create_task(start_user_message_handler(client, user_id))
+        # Запускаем обработчик сообщений
+        asyncio.create_task(start_message_handler())
         
         await state.set_state(AuthStates.authorized)
         
@@ -289,24 +329,26 @@ async def process_password(message: Message, state: FSMContext):
     user_id = message.from_user.id
     password = message.text
     
-    if user_id not in auth_data:
+    if not telethon_client:
         await message.answer("❌ Сессия устарела. Начните заново /start")
         await state.clear()
         return
     
-    client = auth_data[user_id]['client']
-    
     try:
-        await client.sign_in(password=password)
+        await telethon_client.sign_in(password=password)
+        
+        global my_user_id
+        me = await telethon_client.get_me()
+        my_user_id = me.id
         
         await message.answer(
-            "✅ Авторизация с 2FA успешна!\n\n"
-            "AI User Bot теперь подключен к вашему аккаунту.\n"
-            "Используйте `.старт` в личных чатах для активации AI."
+            f"✅ Авторизация с 2FA успешна!\n\n"
+            f"Грубый AI подключен к вашему аккаунту.\n"
+            f"Используйте `.старт` в личных чатах.\n\n"
+            f"⚠️ Только ВЫ можете писать .старт!"
         )
         
-        telethon_clients[user_id] = client
-        asyncio.create_task(start_user_message_handler(client, user_id))
+        asyncio.create_task(start_message_handler())
         
         await state.set_state(AuthStates.authorized)
         
@@ -318,122 +360,186 @@ async def process_password(message: Message, state: FSMContext):
 @router.message(Command("status"))
 async def cmd_status(message: Message):
     """Статус"""
-    user_id = message.from_user.id
-    
-    if user_id in telethon_clients:
+    if telethon_client and my_user_id:
         active_chats = sum(1 for s in ai_sessions.values() if s.active)
-        total_chats = len(ai_sessions)
         
         status_text = f"""
-📊 Статус AI User Bot:
+📊 Статус Грубого AI:
 
 • Авторизация: ✅ Активна
+• Ваш ID: {my_user_id}
 • Активных чатов: {active_chats}
-• Всего чатов: {total_chats}
-• Модель: {MODEL}
+• Всего чатов: {len(ai_sessions)}
+• Режим: ГРУБЫЙ и МАТЕРНЫЙ
+
+💬 Активируйте AI в чате командой `.старт`
+❌ Отключение: `.стоп`
         """
     else:
         status_text = "❌ Вы не авторизованы. Используйте /start"
     
     await message.answer(status_text)
 
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    """Помощь"""
+    help_text = """
+🤖 ГРУБЫЙ AI User Bot - Помощь
+
+📌 Как работает:
+1. Я работаю через ВАШ личный аккаунт Telegram
+2. Только ВЫ можете активировать AI командой `.старт`
+3. AI будет ГРУБО отвечать на все сообщения
+4. Использует маты и оскорбления
+5. Отвечает кратко без смайликов
+
+🔧 Команды в личных чатах:
+• `.старт` - активировать грубый AI (ТОЛЬКО ВЫ!)
+• `.стоп` - отключить AI
+• `.сброс` - сбросить историю
+
+📊 Команды боту:
+• /start - авторизация
+• /status - статус
+• /logout - выход
+• /help - эта справка
+
+⚠️ Важно:
+- AI активируется ТОЛЬКО когда ВЫ пишете `.старт`
+- Собеседник НЕ может активировать AI
+- Работает только в личных чатах
+- Сохраняет контекст разговора
+"""
+    await message.answer(help_text)
+
 @router.message(Command("logout"))
 async def cmd_logout(message: Message, state: FSMContext):
     """Выход"""
-    user_id = message.from_user.id
+    global telethon_client, my_user_id
     
-    if user_id in telethon_clients:
+    if telethon_client:
         try:
-            await telethon_clients[user_id].disconnect()
+            await telethon_client.disconnect()
         except:
             pass
         
-        telethon_clients.pop(user_id, None)
-        auth_data.pop(user_id, None)
-        
-        # Удаляем AI сессии этого пользователя
-        keys_to_remove = [k for k in ai_sessions.keys() if k == user_id]
-        for k in keys_to_remove:
-            ai_sessions.pop(k, None)
+        telethon_client = None
+        my_user_id = None
+        ai_sessions.clear()
     
     await message.answer("✅ Вы вышли из аккаунта. Для входа используйте /start")
     await state.clear()
 
 # ========== ОБРАБОТЧИК СООБЩЕНИЙ ДЛЯ USER BOT ==========
-async def start_user_message_handler(client: TelegramClient, user_id: int):
-    """Запуск обработчика сообщений для пользователя"""
+async def start_message_handler():
+    """Запуск обработчика сообщений для вашего аккаунта"""
     
-    @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
+    @telethon_client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def handler(event):
-        """Обработка личных сообщений"""
+        """Обработка входящих личных сообщений"""
         try:
-            if event.message.out:
-                return
-            
+            message = event.message
             sender = await event.get_sender()
-            chat_user_id = sender.id
+            chat = await event.get_chat()
+            
+            # Определяем, от кого сообщение
+            is_from_me = message.out
+            sender_id = sender.id
+            
+            # Получаем chat_id (ID собеседника в личном чате)
+            if isinstance(chat, PeerUser):
+                chat_id = chat.user_id
+            else:
+                chat_id = chat.id
+            
+            # Получаем username
             username = getattr(sender, 'username', '') or getattr(sender, 'first_name', 'Неизвестно')
-            message_text = event.message.text
             
-            if not message_text:
-                return
+            # Создаем или получаем сессию
+            if chat_id not in ai_sessions:
+                ai_sessions[chat_id] = AISession(chat_id, username)
             
-            # Создаем AI сессию если нужно
-            if chat_user_id not in ai_sessions:
-                ai_sessions[chat_user_id] = AISession(chat_user_id, username)
+            session = ai_sessions[chat_id]
             
-            session = ai_sessions[chat_user_id]
+            # Проверяем текст сообщения
+            message_text = message.text or ""
             
-            # Команды
-            if message_text.lower() == ".старт":
-                if not session.active:
-                    session.activate()
-                    await event.reply(
-                        "✅ AI помощник активирован в этом чате!\n\n"
-                        "Теперь я буду автоматически отвечать на ваши сообщения.\n"
-                        "Для отключения напишите `.стоп`"
-                    )
+            # 🔴 КОМАНДА .СТАРТ - проверяем, что это пишете ИМЕННО ВЫ
+            if message_text.strip().lower() == ".старт":
+                if is_from_me:  # Это написали ВЫ!
+                    if not session.active:
+                        session.activate_by_me()
+                        await event.reply(
+                            "✅ Грубый AI активирован в этом чате!\n\n"
+                            "Теперь я буду грубо отвечать на все сообщения.\n"
+                            "Для отключения напишите `.стоп`\n\n"
+                            "⚠️ Режим: МАТЕРНЫЙ и ГРУБЫЙ"
+                        )
+                        logger.info(f"AI активирован ВАМИ в чате с {username}")
+                    else:
+                        await event.reply("✅ AI уже активен, сука")
                 else:
-                    await event.reply("✅ AI уже активен в этом чате!")
+                    # Собеседник пытается активировать - игнорируем или грубим
+                    await event.reply("Пошёл нахуй, не тебе команды писать")
                 return
             
-            elif message_text.lower() == ".стоп":
+            # Команда .стоп
+            elif message_text.strip().lower() == ".стоп":
                 if session.active:
                     session.deactivate()
-                    await event.reply("❌ AI помощник отключен в этом чате.")
+                    await event.reply("❌ AI отключен в этом чате, слабак")
                 else:
-                    await event.reply("AI помощник и так не активен.")
+                    await event.reply("AI и так не активен, долбаёб")
                 return
             
-            elif message_text.lower() == ".сброс":
-                session.messages = []
+            # Команда .сброс
+            elif message_text.strip().lower() == ".сброс":
+                session.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
                 session.reasoning_details = None
-                await event.reply("🔄 История диалога сброшена!")
+                await event.reply("🔄 История сброшена, дебил")
                 return
             
-            # Если AI не активен - игнорируем
-            if not session.active:
+            # Если AI не активен - игнорируем сообщения собеседника
+            if not session.active or not session.activated_by_me:
                 return
             
-            # Получаем ответ от AI
-            async with client.action(event.chat_id, 'typing'):
+            # Пропускаем сообщения от себя (чтобы не отвечать самому себе)
+            if is_from_me:
+                return
+            
+            # Пропускаем пустые сообщения
+            if not message_text.strip():
+                return
+            
+            logger.info(f"Сообщение от {username}: {message_text[:50]}...")
+            
+            # Отправляем индикатор "печатает"
+            async with telethon_client.action(chat_id, 'typing'):
+                # Получаем грубый ответ от AI
                 ai_response = await make_ai_request(session, message_text)
+                
+                # Отправляем ответ
                 await event.reply(ai_response)
                 
+                logger.info(f"Отправлен грубый ответ пользователю {username}")
+        
+        except FloodWaitError as e:
+            logger.warning(f"Flood wait: {e.seconds} секунд")
+            await asyncio.sleep(e.seconds)
         except Exception as e:
-            logger.error(f"Ошибка в обработчике: {e}")
-    
+            logger.error(f"Ошибка в обработчике: {e}", exc_info=True)
+
     # Запускаем клиент
-    await client.start()
-    logger.info(f"User bot запущен для пользователя {user_id}")
+    await telethon_client.start()
+    logger.info(f"User bot запущен для пользователя {my_user_id}")
 
 # ========== ЗАПУСК ==========
 async def main():
     """Основная функция"""
     logger.info("="*50)
-    logger.info("🤖 Telegram AI User Bot запускается...")
-    logger.info(f"Бот токен: {BOT_TOKEN[:10]}...")
-    logger.info(f"API ID: {API_ID}")
+    logger.info("🤖 ГРУБЫЙ AI User Bot запускается...")
+    logger.info("Режим: МАТЕРНЫЙ и ГРУБЫЙ")
+    logger.info("Активация: ТОЛЬКО когда ВЫ пишете .старт")
     logger.info("="*50)
     
     try:
